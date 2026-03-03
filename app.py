@@ -3,7 +3,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import base64
 import streamlit as st
 import requests
-from streamlit_cookies_controller import CookieController
+import extra_streamlit_components as stx
 from agent import create_agent_session, chat_with_agent
 from config import GROQ_API_KEY, get_github_headers, GITHUB_API
 from tools.files import create_or_update_file
@@ -37,15 +37,18 @@ st.markdown("""
     font-size: 0.8em;
     font-weight: bold;
 }
-.session-time {
-    font-size: 0.75em;
-    color: #888;
-}
+.session-time { font-size: 0.75em; color: #888; }
 </style>
 """, unsafe_allow_html=True)
 
-# ── Cookie Controller (saves login in browser) ─────────────────────────
-cookie = CookieController()
+
+# ── Cookie Manager ─────────────────────────────────────────────────────
+@st.cache_resource
+def get_cookie_manager():
+    return stx.CookieManager()
+
+cookie_manager = get_cookie_manager()
+
 
 # ── Session State Init ─────────────────────────────────────────────────
 for key, default in [
@@ -94,8 +97,8 @@ def start_new_session():
     st.session_state.chat_history = []
 
 
-def do_connect(token: str) -> bool:
-    """Verify token, set session state, save cookie. Returns True on success."""
+def do_connect(token: str):
+    """Verify token and set up session. Returns (True, None) or (False, error)."""
     username, error = verify_github_token(token)
     if not username:
         return False, error
@@ -113,17 +116,19 @@ def do_connect(token: str) -> bool:
     return True, None
 
 
-# ── Auto-connect from cookie (like "remember me") ─────────────────────
+# ── Auto-connect from cookie ───────────────────────────────────────────
 if not st.session_state.connected and not st.session_state.auto_connect_tried:
     st.session_state.auto_connect_tried = True
-    saved_token = cookie.get("gh_token")
-    if saved_token:
-        success, _ = do_connect(saved_token)
-        if success:
-            st.rerun()
-        else:
-            # Token expired or revoked — clear cookie
-            cookie.remove("gh_token")
+    try:
+        saved_token = cookie_manager.get("gh_token")
+        if saved_token:
+            success, _ = do_connect(saved_token)
+            if not success:
+                cookie_manager.delete("gh_token")
+            else:
+                st.rerun()
+    except Exception:
+        pass
 
 # ── Header ─────────────────────────────────────────────────────────────
 st.markdown("# 🐙 GitHub Agent")
@@ -133,7 +138,7 @@ st.divider()
 # ── Login Page ─────────────────────────────────────────────────────────
 if not st.session_state.connected:
     st.markdown("### 🔑 Connect Your GitHub Account")
-    st.info("Enter your GitHub Personal Access Token to log in. Your session will be saved so you don't have to log in again.")
+    st.info("Enter your GitHub token once — you won't need to enter it again.")
     st.markdown("**GitHub Personal Access Token** ([create one here](https://github.com/settings/tokens))")
     github_token = st.text_input("GitHub Token", type="password", placeholder="ghp_...", label_visibility="collapsed")
     st.caption("Needs scopes: `repo`, `delete_repo`, `read:user`")
@@ -147,8 +152,8 @@ if not st.session_state.connected:
             with st.spinner("Verifying..."):
                 success, error = do_connect(github_token)
                 if success:
-                    # Save token in browser cookie — this is the "remember me"
-                    cookie.set("gh_token", github_token, max_age=30*24*60*60)  # 30 days
+                    # Save in browser cookie for 30 days
+                    cookie_manager.set("gh_token", github_token, max_age=30*24*60*60)
                     st.success(f"✅ Connected as **{st.session_state.github_username}**!")
                     st.rerun()
                 else:
@@ -278,9 +283,11 @@ else:
                 st.session_state.prefill = ex
 
         st.markdown("---")
-        # Logout button — clears cookie so next visit asks to login again
         if st.button("🚪 Logout", use_container_width=True):
-            cookie.remove("gh_token")
+            try:
+                cookie_manager.delete("gh_token")
+            except Exception:
+                pass
             for k in ["chat_session", "chat_history", "github_username", "github_token",
                       "user_id", "connected", "current_session_id", "auto_connect_tried"]:
                 st.session_state[k] = None if k in ["chat_session", "current_session_id"] else \
