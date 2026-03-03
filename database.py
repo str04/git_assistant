@@ -1,281 +1,145 @@
+import sqlite3
 import os
 import json
-import sqlite3
+import hashlib
 from datetime import datetime, timedelta
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agent.db")
 
 
-def _conn():
-    # check_same_thread=False helps Streamlit
-    return sqlite3.connect(DB_PATH, check_same_thread=False)
+def get_user_id(github_token: str) -> str:
+    """Hash the GitHub token to create a unique private user ID."""
+    return hashlib.sha256(github_token.encode()).hexdigest()[:16]
 
 
 def init_db():
-    conn = _conn()
-    cur = conn.cursor()
-
-    # Settings are user-scoped via (user_id, key)
-    # We'll also store global app settings under user_id='__app__'
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS settings (
-        user_id TEXT NOT NULL,
-        key     TEXT NOT NULL,
-        value   TEXT NOT NULL,
-        PRIMARY KEY (user_id, key)
-    )
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS chat_sessions (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id    TEXT NOT NULL,
+            title      TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
     """)
-
-    # Sessions are user-scoped
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS chat_sessions (
-        id         INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id    TEXT NOT NULL,
-        title      TEXT NOT NULL,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-    )
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS chat_messages (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id INTEGER NOT NULL,
+            role       TEXT NOT NULL,
+            content    TEXT NOT NULL,
+            tool_calls TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (session_id) REFERENCES chat_sessions(id)
+        )
     """)
-
-    # Messages are user-scoped
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS chat_messages (
-        id         INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id    TEXT NOT NULL,
-        session_id INTEGER NOT NULL,
-        role       TEXT NOT NULL,
-        content    TEXT NOT NULL,
-        tool_calls TEXT,
-        created_at TEXT NOT NULL,
-        FOREIGN KEY (session_id) REFERENCES chat_sessions(id)
-    )
-    """)
-
     conn.commit()
     conn.close()
 
 
-# ──────────────────────────────────────────────────────────────────────
-# "Stay logged in" helpers (global app setting)
-# ──────────────────────────────────────────────────────────────────────
-def set_last_user(user_id: str):
-    init_db()
-    conn = _conn()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO settings (user_id, key, value)
-        VALUES ('__app__', 'last_user', ?)
-        ON CONFLICT(user_id, key) DO UPDATE SET value=excluded.value
-    """, (user_id,))
-    conn.commit()
-    conn.close()
-
-
-def get_last_user() -> str:
-    init_db()
-    conn = _conn()
-    cur = conn.cursor()
-    cur.execute("SELECT value FROM settings WHERE user_id='__app__' AND key='last_user'")
-    row = cur.fetchone()
-    conn.close()
-    return row[0] if row else ""
-
-
-# ──────────────────────────────────────────────────────────────────────
-# Token (per user)
-# ──────────────────────────────────────────────────────────────────────
-def save_token(user_id: str, token: str):
-    init_db()
-    conn = _conn()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO settings (user_id, key, value)
-        VALUES (?, 'github_token', ?)
-        ON CONFLICT(user_id, key) DO UPDATE SET value=excluded.value
-    """, (user_id, token))
-    conn.commit()
-    conn.close()
-
-
-def load_token(user_id: str) -> str:
-    init_db()
-    conn = _conn()
-    cur = conn.cursor()
-    cur.execute("SELECT value FROM settings WHERE user_id=? AND key='github_token'", (user_id,))
-    row = cur.fetchone()
-    conn.close()
-    return row[0] if row else ""
-
-
-def clear_token(user_id: str):
-    init_db()
-    conn = _conn()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM settings WHERE user_id=? AND key='github_token'", (user_id,))
-    conn.commit()
-    conn.close()
-
-
-# ──────────────────────────────────────────────────────────────────────
-# Sessions (per user)
-# ──────────────────────────────────────────────────────────────────────
 def create_session(user_id: str, title: str = "New Chat") -> int:
     init_db()
     now = datetime.now().isoformat()
-    conn = _conn()
-    cur = conn.cursor()
-    cur.execute(
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
         "INSERT INTO chat_sessions (user_id, title, created_at, updated_at) VALUES (?, ?, ?, ?)",
         (user_id, title, now, now)
     )
-    sid = cur.lastrowid
+    session_id = cursor.lastrowid
     conn.commit()
     conn.close()
-    return sid
+    return session_id
 
 
 def get_all_sessions(user_id: str) -> list:
+    """Get ONLY this user's sessions."""
     init_db()
-    conn = _conn()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT id, title, updated_at
-        FROM chat_sessions
-        WHERE user_id=?
-        ORDER BY updated_at DESC
-    """, (user_id,))
-    rows = cur.fetchall()
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute(
+        "SELECT id, title, updated_at FROM chat_sessions WHERE user_id = ? ORDER BY updated_at DESC",
+        (user_id,)
+    ).fetchall()
     conn.close()
-
-    out = []
-    for sid, title, updated_at in rows:
-        # UI-friendly time
-        ts = (updated_at or "")[:16].replace("T", " ")
-        out.append({"id": sid, "title": title, "updated_at": ts})
-    return out
+    return [{"id": r[0], "title": r[1], "updated_at": r[2][:16].replace("T", " ")} for r in rows]
 
 
-def update_session_title(user_id: str, session_id: int, title: str):
+def update_session_title(session_id: int, user_id: str, title: str):
     init_db()
-    conn = _conn()
-    cur = conn.cursor()
-    cur.execute("""
-        UPDATE chat_sessions
-        SET title=?
-        WHERE user_id=? AND id=?
-    """, (title, user_id, session_id))
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "UPDATE chat_sessions SET title = ? WHERE id = ? AND user_id = ?",
+        (title, session_id, user_id)
+    )
     conn.commit()
     conn.close()
 
 
-def delete_session(user_id: str, session_id: int):
+def delete_session(session_id: int, user_id: str):
     init_db()
-    conn = _conn()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM chat_messages WHERE user_id=? AND session_id=?", (user_id, session_id))
-    cur.execute("DELETE FROM chat_sessions WHERE user_id=? AND id=?", (user_id, session_id))
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("DELETE FROM chat_messages WHERE session_id = ?", (session_id,))
+    conn.execute("DELETE FROM chat_sessions WHERE id = ? AND user_id = ?", (session_id, user_id))
     conn.commit()
     conn.close()
 
 
-# ──────────────────────────────────────────────────────────────────────
-# Messages (per user)
-# ──────────────────────────────────────────────────────────────────────
-def save_message(user_id: str, session_id: int, role: str, content: str, tool_calls: list = None):
+def save_message(session_id: int, role: str, content: str, tool_calls: list = None):
     init_db()
     now = datetime.now().isoformat()
-    conn = _conn()
-    cur = conn.cursor()
-
-    cur.execute("""
-        INSERT INTO chat_messages (user_id, session_id, role, content, tool_calls, created_at)
-        VALUES (?, ?, ?, ?, ?, ?)
-    """, (
-        user_id,
-        session_id,
-        role,
-        content,
-        json.dumps(tool_calls) if tool_calls else None,
-        now
-    ))
-
-    cur.execute("""
-        UPDATE chat_sessions
-        SET updated_at=?
-        WHERE user_id=? AND id=?
-    """, (now, user_id, session_id))
-
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "INSERT INTO chat_messages (session_id, role, content, tool_calls, created_at) VALUES (?, ?, ?, ?, ?)",
+        (session_id, role, content, json.dumps(tool_calls) if tool_calls else None, now)
+    )
+    conn.execute("UPDATE chat_sessions SET updated_at = ? WHERE id = ?", (now, session_id))
     conn.commit()
     conn.close()
 
 
-def load_messages(user_id: str, session_id: int) -> list:
+def load_messages(session_id: int) -> list:
     init_db()
-    conn = _conn()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT role, content, tool_calls
-        FROM chat_messages
-        WHERE user_id=? AND session_id=?
-        ORDER BY created_at ASC
-    """, (user_id, session_id))
-    rows = cur.fetchall()
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute(
+        "SELECT role, content, tool_calls FROM chat_messages WHERE session_id = ? ORDER BY created_at ASC",
+        (session_id,)
+    ).fetchall()
     conn.close()
-
-    out = []
-    for role, content, tool_calls in rows:
-        out.append({
-            "role": role,
-            "content": content,
-            "tool_calls": json.loads(tool_calls) if tool_calls else None
-        })
-    return out
+    return [
+        {"role": r[0], "content": r[1], "tool_calls": json.loads(r[2]) if r[2] else None}
+        for r in rows
+    ]
 
 
-def load_messages_for_agent(user_id: str, session_id: int, limit: int = 6) -> list:
-    """
-    Short context window for LLM (last N user/assistant messages).
-    """
+def load_messages_for_agent(session_id: int, limit: int = 4) -> list:
     init_db()
-    conn = _conn()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT role, content
-        FROM chat_messages
-        WHERE user_id=? AND session_id=? AND role IN ('user','assistant')
-        ORDER BY created_at DESC
-        LIMIT ?
-    """, (user_id, session_id, limit))
-    rows = cur.fetchall()
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute(
+        """SELECT role, content FROM chat_messages
+           WHERE session_id = ? AND role IN ('user', 'assistant')
+           ORDER BY created_at DESC LIMIT ?""",
+        (session_id, limit)
+    ).fetchall()
     conn.close()
-
-    # reverse back to chronological
     return [{"role": r[0], "content": r[1]} for r in reversed(rows)]
 
 
-# ──────────────────────────────────────────────────────────────────────
-# Cleanup (optionally per-user, but default global)
-# ──────────────────────────────────────────────────────────────────────
-def cleanup_old_sessions(days: int = 30, user_id: str | None = None):
+def cleanup_old_sessions(user_id: str, days: int = 30):
     init_db()
     cutoff = (datetime.now() - timedelta(days=days)).isoformat()
-
-    conn = _conn()
-    cur = conn.cursor()
-
-    if user_id:
-        cur.execute("SELECT id FROM chat_sessions WHERE user_id=? AND updated_at < ?", (user_id, cutoff))
-        old_ids = [r[0] for r in cur.fetchall()]
-        for sid in old_ids:
-            cur.execute("DELETE FROM chat_messages WHERE user_id=? AND session_id=?", (user_id, sid))
-            cur.execute("DELETE FROM chat_sessions WHERE user_id=? AND id=?", (user_id, sid))
-    else:
-        # global cleanup
-        cur.execute("SELECT id, user_id FROM chat_sessions WHERE updated_at < ?", (cutoff,))
-        rows = cur.fetchall()
-        for sid, uid in rows:
-            cur.execute("DELETE FROM chat_messages WHERE user_id=? AND session_id=?", (uid, sid))
-            cur.execute("DELETE FROM chat_sessions WHERE user_id=? AND id=?", (uid, sid))
-
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT id FROM chat_sessions WHERE user_id = ? AND updated_at < ?",
+        (user_id, cutoff)
+    )
+    for r in cursor.fetchall():
+        conn.execute("DELETE FROM chat_messages WHERE session_id = ?", (r[0],))
+    conn.execute(
+        "DELETE FROM chat_sessions WHERE user_id = ? AND updated_at < ?",
+        (user_id, cutoff)
+    )
     conn.commit()
     conn.close()
