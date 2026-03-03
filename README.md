@@ -1,4 +1,4 @@
-# 🐙 GitHub Agent
+# 🐙 GitHub Assistant
 
 An AI-powered GitHub assistant that lets you manage your entire GitHub workflow through natural conversation.
 
