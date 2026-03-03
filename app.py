@@ -3,6 +3,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import base64
 import streamlit as st
 import requests
+from streamlit_cookies_controller import CookieController
 from agent import create_agent_session, chat_with_agent
 from config import GROQ_API_KEY, get_github_headers, GITHUB_API
 from tools.files import create_or_update_file
@@ -43,9 +44,10 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+# ── Cookie Controller (saves login in browser) ─────────────────────────
+cookie = CookieController()
+
 # ── Session State Init ─────────────────────────────────────────────────
-# Token lives ONLY in browser session state — never saved to DB
-# So each user who opens the URL gets a completely fresh, isolated experience
 for key, default in [
     ("chat_session", None),
     ("github_username", ""),
@@ -54,6 +56,7 @@ for key, default in [
     ("connected", False),
     ("current_session_id", None),
     ("chat_history", []),
+    ("auto_connect_tried", False),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -91,15 +94,46 @@ def start_new_session():
     st.session_state.chat_history = []
 
 
+def do_connect(token: str) -> bool:
+    """Verify token, set session state, save cookie. Returns True on success."""
+    username, error = verify_github_token(token)
+    if not username:
+        return False, error
+    user_id = get_user_id(token)
+    st.session_state.github_token = token
+    st.session_state.user_id = user_id
+    st.session_state.github_username = username
+    st.session_state.connected = True
+    cleanup_old_sessions(user_id, days=30)
+    sessions = get_all_sessions(user_id)
+    if sessions:
+        load_session(sessions[0]["id"])
+    else:
+        start_new_session()
+    return True, None
+
+
+# ── Auto-connect from cookie (like "remember me") ─────────────────────
+if not st.session_state.connected and not st.session_state.auto_connect_tried:
+    st.session_state.auto_connect_tried = True
+    saved_token = cookie.get("gh_token")
+    if saved_token:
+        success, _ = do_connect(saved_token)
+        if success:
+            st.rerun()
+        else:
+            # Token expired or revoked — clear cookie
+            cookie.remove("gh_token")
+
 # ── Header ─────────────────────────────────────────────────────────────
 st.markdown("# 🐙 GitHub Agent")
 st.caption("Manage your GitHub workflow through natural conversation — powered by Groq AI (free)")
 st.divider()
 
-# ── Connection Panel ───────────────────────────────────────────────────
+# ── Login Page ─────────────────────────────────────────────────────────
 if not st.session_state.connected:
     st.markdown("### 🔑 Connect Your GitHub Account")
-    st.info("Enter your GitHub Personal Access Token. Each person has their own private session.")
+    st.info("Enter your GitHub Personal Access Token to log in. Your session will be saved so you don't have to log in again.")
     st.markdown("**GitHub Personal Access Token** ([create one here](https://github.com/settings/tokens))")
     github_token = st.text_input("GitHub Token", type="password", placeholder="ghp_...", label_visibility="collapsed")
     st.caption("Needs scopes: `repo`, `delete_repo`, `read:user`")
@@ -111,28 +145,12 @@ if not st.session_state.connected:
             st.error("Please enter your GitHub token.")
         else:
             with st.spinner("Verifying..."):
-                username, error = verify_github_token(github_token)
-                if username:
-                    try:
-                        # Token stays in browser only — never written to DB
-                        user_id = get_user_id(github_token)
-                        st.session_state.github_token = github_token
-                        st.session_state.user_id = user_id
-                        st.session_state.github_username = username
-                        st.session_state.connected = True
-
-                        cleanup_old_sessions(user_id, days=30)
-
-                        sessions = get_all_sessions(user_id)
-                        if sessions:
-                            load_session(sessions[0]["id"])
-                        else:
-                            start_new_session()
-
-                        st.success(f"✅ Connected as **{username}**!")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Failed to initialize: {e}")
+                success, error = do_connect(github_token)
+                if success:
+                    # Save token in browser cookie — this is the "remember me"
+                    cookie.set("gh_token", github_token, max_age=30*24*60*60)  # 30 days
+                    st.success(f"✅ Connected as **{st.session_state.github_username}**!")
+                    st.rerun()
                 else:
                     st.error(f"❌ Invalid token: {error}")
 
@@ -222,7 +240,7 @@ else:
 
         st.markdown("---")
 
-        # ── Chat History (this user only) ──────────────────────────────
+        # ── Chat History ───────────────────────────────────────────────
         st.markdown("### 🕓 Chat History")
         all_sessions = get_all_sessions(st.session_state.user_id)
 
@@ -260,8 +278,11 @@ else:
                 st.session_state.prefill = ex
 
         st.markdown("---")
-        if st.button("🔄 Use a different token", use_container_width=True):
-            for k in ["chat_session", "chat_history", "github_username", "github_token", "user_id", "connected", "current_session_id"]:
+        # Logout button — clears cookie so next visit asks to login again
+        if st.button("🚪 Logout", use_container_width=True):
+            cookie.remove("gh_token")
+            for k in ["chat_session", "chat_history", "github_username", "github_token",
+                      "user_id", "connected", "current_session_id", "auto_connect_tried"]:
                 st.session_state[k] = None if k in ["chat_session", "current_session_id"] else \
                     ([] if k == "chat_history" else ("" if k in ["github_username", "github_token", "user_id"] else False))
             st.rerun()

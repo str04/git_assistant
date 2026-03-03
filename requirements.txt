@@ -2,3 +2,4 @@ groq
 streamlit
 requests
 python-dotenv
+streamlit-cookies-controller
