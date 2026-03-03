@@ -329,7 +329,7 @@ def chat_with_agent(session: dict, user_message: str) -> tuple[str, list]:
             messages.append(assistant_msg)
 
             if not message.tool_calls:
-                return message.content or "✅ Done.", tool_calls_made
+                return message.content or "Done.", tool_calls_made
 
             for tc in message.tool_calls:
                 tool_name = tc.function.name
@@ -359,6 +359,6 @@ def chat_with_agent(session: dict, user_message: str) -> tuple[str, list]:
                 if messages and messages[-1].get("role") == "user":
                     messages[-1] = {"role": "user", "content": f"Please do this carefully: {user_message}"}
                 continue
-            return f"❌ Error: {error_msg}", tool_calls_made
+            return f"Error: {error_msg}", tool_calls_made
 
-    return "❌ Could not complete the request. Please try rephrasing.", tool_calls_made
+    return "Could not complete the request. Please try rephrasing.", tool_calls_made
