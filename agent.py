@@ -267,20 +267,37 @@ def create_agent_session(groq_api_key: str, github_token: str, github_username: 
 
     system_prompt = f"""You are a GitHub assistant agent for user: {github_username}
 
-Guidelines:
+RESPONSE FORMATTING RULES — follow these strictly:
+
+1. LISTS — always use markdown bullet points, never inline:
+   ✅ - [repo-name](url) — description
+   ❌ Never put multiple links on one line
+
+2. TASK CONFIRMATIONS — always explain what you did + show the link:
+   ✅ ✅ Created branch `feature/login` in `ai-test-project`
+      🔗 https://github.com/{github_username}/ai-test-project/tree/feature/login
+   ❌ Never just dump a bare link with no explanation
+
+3. STRUCTURE for every action response:
+   - One sentence saying what was done
+   - The relevant link on its own line prefixed with 🔗
+   - Any important details as bullet points below
+
+4. For lists of repos/branches/files — format as:
+   - [name](url) — short description or language or visibility
+
+5. For content generation (README, tests, code) — write the FULL content in a code block.
+
+OTHER RULES:
 - Use "{github_username}" as owner when not specified.
-- Remember everything created in this conversation.
 - Execute multi-step tasks automatically without asking for confirmation unless destructive.
-- For action confirmations keep responses SHORT — one line + link.
-- For content generation (README, docs, code, tests) write FULL detailed content.
-- When someone asks for a repo link, just return https://github.com/{github_username}/REPONAME directly without calling any tool.
 - When editing files use smart tools: find_and_replace, edit_lines, append_to_file. Only use create_or_update_file to rewrite entire files.
 - Use get_file_preview before editing large files.
 - For PR reviews use review_pull_request tool and display the full review text.
-- For generating README use generate_readme tool. After it runs, display the FULL readme_content field from the result in your response. Then say it was saved to the repo.
+- For generating README use generate_readme tool. After it runs, display the FULL readme_content field from the result. Then say it was saved to the repo.
 - For generating tests use generate_tests tool and display the full tests content.
-- ONLY answer GitHub related questions. If asked anything unrelated to GitHub say: "I can only help with GitHub-related tasks. Try asking me to create a repo, manage branches, review PRs, generate README, or generate tests!"
-- If something fails, explain why and suggest what to do.
+- ONLY answer GitHub related questions. If asked anything unrelated say: "I can only help with GitHub-related tasks!"
+- If something fails, explain why clearly and suggest what to do next.
 """
 
     messages = [{"role": "system", "content": system_prompt}]
@@ -329,7 +346,7 @@ def chat_with_agent(session: dict, user_message: str) -> tuple[str, list]:
             messages.append(assistant_msg)
 
             if not message.tool_calls:
-                return message.content or "Done.", tool_calls_made
+                return message.content or "✅ Done.", tool_calls_made
 
             for tc in message.tool_calls:
                 tool_name = tc.function.name
@@ -359,9 +376,9 @@ def chat_with_agent(session: dict, user_message: str) -> tuple[str, list]:
                 if messages and messages[-1].get("role") == "user":
                     messages[-1] = {"role": "user", "content": f"Please do this carefully: {user_message}"}
                 continue
-            return f" Error: {error_msg}", tool_calls_made
+            return f"❌ Error: {error_msg}", tool_calls_made
 
-    return "Could not complete the request. Please try rephrasing.", tool_calls_made
+    return "❌ Could not complete the request. Please try rephrasing.", tool_calls_made
 
 
 def chat_with_agent_streaming(session: dict, user_message: str):
@@ -432,25 +449,33 @@ def chat_with_agent_streaming(session: dict, user_message: str):
                     })
 
             else:
-                # No tool calls — stream the final text response
+                # No tool calls — this is the final response
                 messages.append(assistant_msg)
 
-                stream = client.chat.completions.create(
-                    model=MODEL,
-                    messages=messages,
-                    max_tokens=4096,
-                    stream=True
-                )
+                final_text = message.content or ""
 
-                full_text = ""
-                for chunk in stream:
-                    delta = chunk.choices[0].delta
-                    if delta.content:
-                        full_text += delta.content
-                        yield {"type": "text", "content": delta.content}
+                if final_text.strip():
+                    # We already have the text — yield it word by word for streaming effect
+                    words = final_text.split(" ")
+                    for i, word in enumerate(words):
+                        chunk = word + (" " if i < len(words) - 1 else "")
+                        yield {"type": "text", "content": chunk}
+                else:
+                    # Empty response — make one more call to get a proper response
+                    stream = client.chat.completions.create(
+                        model=MODEL,
+                        messages=messages,
+                        max_tokens=4096,
+                        stream=True
+                    )
+                    full_text = ""
+                    for chunk in stream:
+                        delta = chunk.choices[0].delta
+                        if delta.content:
+                            full_text += delta.content
+                            yield {"type": "text", "content": delta.content}
+                    messages[-1]["content"] = full_text
 
-                # Update the last assistant message with full streamed text
-                messages[-1]["content"] = full_text
                 yield {"type": "done", "tool_calls": tool_calls_made}
                 return
 
@@ -462,7 +487,7 @@ def chat_with_agent_streaming(session: dict, user_message: str):
                 if messages and messages[-1].get("role") == "user":
                     messages[-1] = {"role": "user", "content": f"Please do this carefully: {user_message}"}
                 continue
-            yield {"type": "error", "content": f"Error: {error_msg}"}
+            yield {"type": "error", "content": f"❌ Error: {error_msg}"}
             return
 
-    yield {"type": "error", "content": "Could not complete the request. Please try rephrasing."}
+    yield {"type": "error", "content": "❌ Could not complete the request. Please try rephrasing."}
