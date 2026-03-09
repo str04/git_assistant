@@ -4,7 +4,10 @@ import base64
 import streamlit as st
 import requests
 import extra_streamlit_components as stx
-from agent import create_agent_session, chat_with_agent
+from agent import create_agent_session, chat_with_agent, chat_with_agent_streaming
+from multi_agent import run_pipeline
+from bug_fixer import run_bug_fixer
+from issue_to_pr import run_issue_to_pr
 from config import GROQ_API_KEY, get_github_headers, GITHUB_API
 from tools.files import create_or_update_file
 from database import (
@@ -38,13 +41,24 @@ st.markdown("""
     font-weight: bold;
 }
 .session-time { font-size: 0.75em; color: #888; }
+.dashboard-card {
+    background: #1e293b;
+    border: 1px solid #334155;
+    border-radius: 10px;
+    padding: 16px;
+    margin: 6px 0;
+}
+.dashboard-card:hover { border-color: #4ade80; }
+.stat-number { font-size: 2em; font-weight: bold; color: #4ade80; }
+.stat-label { font-size: 0.85em; color: #94a3b8; }
+.pr-open { color: #4ade80; }
+.pr-closed { color: #f87171; }
+.issue-open { color: #fb923c; }
 </style>
 """, unsafe_allow_html=True)
 
-
 # ── Cookie Manager ─────────────────────────────────────────────────────
 cookie_manager = stx.CookieManager()
-
 
 # ── Session State Init ─────────────────────────────────────────────────
 for key, default in [
@@ -56,6 +70,7 @@ for key, default in [
     ("current_session_id", None),
     ("chat_history", []),
     ("auto_connect_tried", False),
+    ("show_dashboard", True),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -94,7 +109,6 @@ def start_new_session():
 
 
 def do_connect(token: str):
-    """Verify token and set up session. Returns (True, None) or (False, error)."""
     username, error = verify_github_token(token)
     if not username:
         return False, error
@@ -110,6 +124,42 @@ def do_connect(token: str):
     else:
         start_new_session()
     return True, None
+
+
+# ── Dashboard Helper ───────────────────────────────────────────────────
+def fetch_dashboard_data(token: str, username: str) -> dict:
+    """Fetch repos, PRs, and issues for the dashboard."""
+    headers = {
+        "Authorization": f"token {token}",
+        "Accept": "application/vnd.github.v3+json"
+    }
+    data = {"repos": [], "open_prs": [], "open_issues": []}
+
+    try:
+        # Get repos
+        resp = requests.get(f"{GITHUB_API}/user/repos?sort=updated&per_page=6", headers=headers)
+        if resp.status_code == 200:
+            data["repos"] = resp.json()
+    except Exception:
+        pass
+
+    try:
+        # Get open PRs across all repos
+        resp = requests.get(f"{GITHUB_API}/search/issues?q=author:{username}+type:pr+state:open&per_page=5", headers=headers)
+        if resp.status_code == 200:
+            data["open_prs"] = resp.json().get("items", [])
+    except Exception:
+        pass
+
+    try:
+        # Get open issues assigned to user
+        resp = requests.get(f"{GITHUB_API}/search/issues?q=assignee:{username}+type:issue+state:open&per_page=5", headers=headers)
+        if resp.status_code == 200:
+            data["open_issues"] = resp.json().get("items", [])
+    except Exception:
+        pass
+
+    return data
 
 
 # ── Auto-connect from cookie ───────────────────────────────────────────
@@ -148,7 +198,6 @@ if not st.session_state.connected:
             with st.spinner("Verifying..."):
                 success, error = do_connect(github_token)
                 if success:
-                    # Save in browser cookie for 30 days
                     cookie_manager.set("gh_token", github_token, max_age=30*24*60*60)
                     st.success(f"✅ Connected as **{st.session_state.github_username}**!")
                     st.rerun()
@@ -290,55 +339,346 @@ else:
                     ([] if k == "chat_history" else ("" if k in ["github_username", "github_token", "user_id"] else False))
             st.rerun()
 
-    # ── Chat Area ──────────────────────────────────────────────────────
-    for entry in st.session_state.chat_history:
-        with st.chat_message(entry["role"]):
-            st.markdown(entry["content"])
-            if entry.get("tool_calls"):
-                with st.expander(f"🔧 {len(entry['tool_calls'])} action(s) performed", expanded=False):
-                    for tc in entry["tool_calls"]:
-                        st.markdown(
-                            f'<div class="tool-call"><span class="tool-name">{tc["tool"]}</span>({tc["input"]})</div>',
-                            unsafe_allow_html=True
-                        )
+    # ── Main Area: Two Tabs ────────────────────────────────────────────
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["🏠 Dashboard", "💬 Chat", "🚀 Build Project", "🐛 Bug Fixer", "🎯 Issue → PR"])
 
-    # ── Chat Input ─────────────────────────────────────────────────────
-    prefill = st.session_state.pop("prefill", None)
-    user_input = st.chat_input("Tell me what to do on GitHub...")
-    if prefill and not user_input:
-        user_input = prefill
+    # ── Tab 1: Dashboard ──────────────────────────────────────────────
+    with tab1:
+        st.markdown("### 🏠 Your GitHub Dashboard")
 
-    if user_input:
-        with st.chat_message("user"):
-            st.markdown(user_input)
+        if st.button("🔄 Refresh", key="refresh_dashboard"):
+            if "dashboard_data" in st.session_state:
+                del st.session_state["dashboard_data"]
 
-        save_message(st.session_state.current_session_id, "user", user_input)
-        st.session_state.chat_history.append({"role": "user", "content": user_input})
+        if "dashboard_data" not in st.session_state:
+            with st.spinner("Loading your GitHub data..."):
+                st.session_state["dashboard_data"] = fetch_dashboard_data(
+                    st.session_state.github_token,
+                    st.session_state.github_username
+                )
 
-        if len(st.session_state.chat_history) == 1:
-            title = user_input[:40] + ("..." if len(user_input) > 40 else "")
-            update_session_title(st.session_state.current_session_id, st.session_state.user_id, title)
+        dash = st.session_state["dashboard_data"]
+        repos = dash.get("repos", [])
+        open_prs = dash.get("open_prs", [])
+        open_issues = dash.get("open_issues", [])
 
-        with st.chat_message("assistant"):
-            with st.spinner("Working on it..."):
+        # Stats row
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.markdown(f'<div class="dashboard-card"><div class="stat-number">{len(repos)}</div><div class="stat-label">Recent Repos</div></div>', unsafe_allow_html=True)
+        with c2:
+            st.markdown(f'<div class="dashboard-card"><div class="stat-number pr-open">{len(open_prs)}</div><div class="stat-label">Open Pull Requests</div></div>', unsafe_allow_html=True)
+        with c3:
+            st.markdown(f'<div class="dashboard-card"><div class="stat-number issue-open">{len(open_issues)}</div><div class="stat-label">Open Issues</div></div>', unsafe_allow_html=True)
+
+        st.markdown("---")
+
+        # Repos + PRs side by side
+        col_repos, col_activity = st.columns([1, 1])
+
+        with col_repos:
+            st.markdown("#### 📁 Recent Repositories")
+            if repos:
+                for repo in repos:
+                    lang = repo.get("language") or "Unknown"
+                    stars = repo.get("stargazers_count", 0)
+                    is_private = "🔒" if repo.get("private") else "🌐"
+                    st.markdown(
+                        f'<div class="dashboard-card">' +
+                        f'<strong>{is_private} <a href="{repo["html_url"]}" target="_blank" style="color:#4ade80;text-decoration:none;">{repo["name"]}</a></strong><br>' +
+                        f'<span style="color:#94a3b8;font-size:0.8em;">{lang} • ⭐ {stars}</span>' +
+                        f'<br><span style="color:#64748b;font-size:0.75em;">{repo.get("description","") or ""}</span>' +
+                        '</div>',
+                        unsafe_allow_html=True
+                    )
+            else:
+                st.caption("No repos found")
+
+        with col_activity:
+            st.markdown("#### 🔀 Your Open PRs")
+            if open_prs:
+                for pr in open_prs:
+                    repo_name = pr["repository_url"].split("/")[-1]
+                    st.markdown(
+                        f'<div class="dashboard-card">' +
+                        f'<strong><a href="{pr["html_url"]}" target="_blank" style="color:#4ade80;text-decoration:none;">#{pr["number"]} {pr["title"][:50]}</a></strong><br>' +
+                        f'<span style="color:#94a3b8;font-size:0.8em;">{repo_name}</span>' +
+                        '</div>',
+                        unsafe_allow_html=True
+                    )
+            else:
+                st.caption("No open PRs 🎉")
+
+            st.markdown("#### 🐛 Assigned Issues")
+            if open_issues:
+                for issue in open_issues:
+                    repo_name = issue["repository_url"].split("/")[-1]
+                    st.markdown(
+                        f'<div class="dashboard-card">' +
+                        f'<strong><a href="{issue["html_url"]}" target="_blank" style="color:#fb923c;text-decoration:none;">#{issue["number"]} {issue["title"][:50]}</a></strong><br>' +
+                        f'<span style="color:#94a3b8;font-size:0.8em;">{repo_name}</span>' +
+                        '</div>',
+                        unsafe_allow_html=True
+                    )
+            else:
+                st.caption("No assigned issues 🎉")
+
+    # ── Tab 2: Chat ────────────────────────────────────────────────────
+    with tab2:
+        for entry in st.session_state.chat_history:
+            with st.chat_message(entry["role"]):
+                st.markdown(entry["content"])
+                if entry.get("tool_calls"):
+                    with st.expander(f"🔧 {len(entry['tool_calls'])} action(s) performed", expanded=False):
+                        for tc in entry["tool_calls"]:
+                            st.markdown(
+                                f'<div class="tool-call"><span class="tool-name">{tc["tool"]}</span>({tc["input"]})</div>',
+                                unsafe_allow_html=True
+                            )
+
+        prefill = st.session_state.pop("prefill", None)
+        user_input = st.chat_input("Tell me what to do on GitHub...")
+        if prefill and not user_input:
+            user_input = prefill
+
+        if user_input:
+            with st.chat_message("user"):
+                st.markdown(user_input)
+
+            save_message(st.session_state.current_session_id, "user", user_input)
+            st.session_state.chat_history.append({"role": "user", "content": user_input})
+
+            if len(st.session_state.chat_history) == 1:
+                title = user_input[:40] + ("..." if len(user_input) > 40 else "")
+                update_session_title(st.session_state.current_session_id, st.session_state.user_id, title)
+
+            with st.chat_message("assistant"):
+                tool_calls = []
+                response_text = ""
+
+                # Show tool activity above the streaming text
+                tool_placeholder = st.empty()
+                text_placeholder = st.empty()
+                active_tools = []
+
                 try:
-                    response_text, tool_calls = chat_with_agent(st.session_state.chat_session, user_input)
+                    for chunk in chat_with_agent_streaming(st.session_state.chat_session, user_input):
+
+                        if chunk["type"] == "tool":
+                            # Show which tool is being called
+                            active_tools.append(chunk["tool"])
+                            tool_placeholder.info(f"🔧 Running: {', '.join(active_tools)}...")
+                            tool_calls.append({"tool": chunk["tool"], "input": chunk["input"]})
+
+                        elif chunk["type"] == "text":
+                            # Stream text word by word
+                            response_text += chunk["content"]
+                            text_placeholder.markdown(response_text + "▌")
+
+                        elif chunk["type"] == "done":
+                            # Final render — remove cursor
+                            tool_placeholder.empty()
+                            text_placeholder.markdown(response_text)
+                            tool_calls = chunk["tool_calls"]
+
+                        elif chunk["type"] == "error":
+                            response_text = chunk["content"]
+                            text_placeholder.markdown(response_text)
+
                 except Exception as e:
                     response_text = f"❌ Error: {str(e)}"
-                    tool_calls = []
+                    text_placeholder.markdown(response_text)
 
-            st.markdown(response_text)
-            if tool_calls:
-                with st.expander(f"🔧 {len(tool_calls)} action(s) performed", expanded=False):
-                    for tc in tool_calls:
-                        st.markdown(
-                            f'<div class="tool-call"><span class="tool-name">{tc["tool"]}</span>({tc["input"]})</div>',
-                            unsafe_allow_html=True
-                        )
+                # Show tool calls summary
+                if tool_calls:
+                    with st.expander(f"🔧 {len(tool_calls)} action(s) performed", expanded=False):
+                        for tc in tool_calls:
+                            st.markdown(
+                                f'<div class="tool-call"><span class="tool-name">{tc["tool"]}</span>({tc["input"]})</div>',
+                                unsafe_allow_html=True
+                            )
 
-        save_message(st.session_state.current_session_id, "assistant", response_text, tool_calls or None)
-        st.session_state.chat_history.append({
-            "role": "assistant",
-            "content": response_text,
-            "tool_calls": tool_calls
-        })
+            save_message(st.session_state.current_session_id, "assistant", response_text, tool_calls or None)
+            st.session_state.chat_history.append({
+                "role": "assistant",
+                "content": response_text,
+                "tool_calls": tool_calls
+            })
+
+    # ── Tab 3: Multi-Agent Pipeline ────────────────────────────────────
+    with tab3:
+        st.markdown("### 🚀 Build a Full Project Automatically")
+        st.caption("Describe your project in plain English — 4 AI agents will plan, code, test, and document it, then push everything to GitHub.")
+
+        st.info(
+            "🧠 **Planner Agent** → designs file structure  \n"
+            "🏗️ **Repo Agent** → creates repo and writes all code  \n"
+            "🧪 **Test Agent** → writes unit tests  \n"
+            "📄 **Docs Agent** → generates README"
+        )
+
+        pipeline_examples = [
+            "A FastAPI backend with CRUD endpoints for a todo list app",
+            "A Python web scraper that extracts article titles from news websites",
+            "A simple Express.js REST API with user authentication",
+            "A Python CLI tool that converts CSV files to JSON",
+        ]
+        selected_example = st.selectbox(
+            "Pick an example or write your own below:",
+            [""] + pipeline_examples,
+            key="pipeline_example"
+        )
+        project_prompt = st.text_area(
+            "Describe your project",
+            value=selected_example,
+            placeholder="e.g. A Flask REST API with endpoints for user authentication and a SQLite database",
+            height=100,
+            key="project_prompt"
+        )
+
+        if st.button("▶ Run Pipeline", type="primary", use_container_width=True, key="run_pipeline"):
+            prompt = project_prompt.strip()
+            if not prompt:
+                st.error("Please describe your project first.")
+            else:
+                st.markdown("---")
+                st.markdown("#### 🤖 Agents Working...")
+                final_url = None
+                for update in run_pipeline(
+                    GROQ_API_KEY,
+                    st.session_state.github_token,
+                    st.session_state.github_username,
+                    prompt
+                ):
+                    if update["error"]:
+                        st.error(f"**{update['agent']}** — {update['status']}")
+                        if update["detail"]:
+                            st.caption(update["detail"])
+                    elif update["done"]:
+                        st.success(f"**{update['agent']}** — {update['status']}")
+                        if update["detail"]:
+                            st.caption(update["detail"])
+                    else:
+                        st.info(f"**{update['agent']}** — {update['status']}")
+                        if update["detail"]:
+                            st.caption(update["detail"])
+                    if "repo_url" in update:
+                        final_url = update["repo_url"]
+
+                if final_url:
+                    st.balloons()
+                    st.markdown(f"### ✅ Project ready!")
+                    st.markdown(f"[🔗 View on GitHub]({final_url})")
+
+    # ── Tab 4: Bug Fixer ───────────────────────────────────────────────
+    with tab4:
+        st.markdown("### 🐛 Auto Bug Fixer")
+        st.caption("Paste your error message — the agent finds the bug, fixes it, and opens a PR automatically.")
+
+        bf_repo = st.text_input("Repository name", placeholder="my-repo", key="bf_repo")
+        bf_branch = st.text_input("Branch", value="main", key="bf_branch")
+        bf_error = st.text_area(
+            "Paste your error message or traceback",
+            placeholder="""Traceback (most recent call last):
+  File "app.py", line 42, in get_user
+    return db.query(User).filter_by(id=user_id).first()
+AttributeError: 'NoneType' object has no attribute 'query'""",
+            height=200,
+            key="bf_error"
+        )
+
+        if st.button("🔧 Fix Bug Automatically", type="primary", use_container_width=True, key="run_bug_fixer"):
+            if not bf_repo.strip():
+                st.error("Please enter the repository name.")
+            elif not bf_error.strip():
+                st.error("Please paste your error message.")
+            else:
+                st.markdown("---")
+                st.markdown("#### 🤖 Bug Fixer Working...")
+                pr_url = None
+
+                for update in run_bug_fixer(
+                    GROQ_API_KEY,
+                    st.session_state.github_token,
+                    st.session_state.github_username,
+                    bf_repo.strip(),
+                    bf_error.strip(),
+                    bf_branch.strip() or "main"
+                ):
+                    if update["error"]:
+                        st.error(update["status"])
+                        if update["detail"]:
+                            st.caption(update["detail"])
+                    elif update["done"]:
+                        st.success(update["status"])
+                        if update["detail"]:
+                            st.caption(update["detail"])
+                    else:
+                        st.info(update["status"])
+                        if update["detail"]:
+                            st.caption(update["detail"])
+
+                    if "pr_url" in update:
+                        pr_url = update["pr_url"]
+
+                if pr_url:
+                    st.balloons()
+                    st.markdown(f"### ✅ Bug Fixed!")
+                    st.markdown(f"[🔗 View Pull Request]({pr_url})")
+
+    # ── Tab 5: Issue → PR Pipeline ────────────────────────────────────
+    with tab5:
+        st.markdown("### 🎯 Issue → Code → PR Pipeline")
+        st.caption("Pick a GitHub issue — the agent reads it, writes the code, and opens a PR automatically.")
+
+        st.info(
+            "📋 **Reads the issue** → understands what to build  \n"
+            "🧠 **Plans the implementation** → decides which files to create/modify  \n"
+            "✍️ **Writes the code** → implements the feature  \n"
+            "📬 **Opens a PR** → linked to the issue, ready to review"
+        )
+
+        col1, col2 = st.columns([2, 1])
+        with col1:
+            itp_repo = st.text_input("Repository name", placeholder="my-repo", key="itp_repo")
+        with col2:
+            itp_issue = st.number_input("Issue number", min_value=1, step=1, key="itp_issue")
+
+        itp_branch = st.text_input("Base branch", value="main", key="itp_branch")
+
+        if st.button("🚀 Implement Issue", type="primary", use_container_width=True, key="run_itp"):
+            if not itp_repo.strip():
+                st.error("Please enter the repository name.")
+            else:
+                st.markdown("---")
+                st.markdown("#### 🤖 Pipeline Running...")
+                pr_url = None
+
+                for update in run_issue_to_pr(
+                    GROQ_API_KEY,
+                    st.session_state.github_token,
+                    st.session_state.github_username,
+                    itp_repo.strip(),
+                    int(itp_issue),
+                    itp_branch.strip() or "main"
+                ):
+                    if update["error"]:
+                        st.error(update["status"])
+                        if update["detail"]:
+                            st.caption(update["detail"])
+                    elif update["done"]:
+                        st.success(update["status"])
+                        if update["detail"]:
+                            st.caption(update["detail"])
+                    else:
+                        st.info(update["status"])
+                        if update["detail"]:
+                            st.caption(update["detail"])
+
+                    if "pr_url" in update:
+                        pr_url = update["pr_url"]
+
+                if pr_url:
+                    st.balloons()
+                    st.markdown(f"### ✅ Done!")
+                    st.markdown(f"[🔗 View Pull Request]({pr_url})")
