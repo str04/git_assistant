@@ -359,6 +359,110 @@ def chat_with_agent(session: dict, user_message: str) -> tuple[str, list]:
                 if messages and messages[-1].get("role") == "user":
                     messages[-1] = {"role": "user", "content": f"Please do this carefully: {user_message}"}
                 continue
-            return f"Error: {error_msg}", tool_calls_made
+            return f" Error: {error_msg}", tool_calls_made
 
     return "Could not complete the request. Please try rephrasing.", tool_calls_made
+
+
+def chat_with_agent_streaming(session: dict, user_message: str):
+    """
+    Streaming version of chat_with_agent.
+    Yields chunks as a generator:
+      - {"type": "tool", "tool": name, "input": args}   when a tool is called
+      - {"type": "text", "content": chunk}               for each streamed text chunk
+      - {"type": "done", "tool_calls": [...]}            when finished
+      - {"type": "error", "content": msg}                on error
+    """
+    client = session["client"]
+    github_token = session["github_token"]
+    github_username = session["github_username"]
+    messages = session["messages"]
+
+    messages.append({"role": "user", "content": user_message})
+    tool_calls_made = []
+    max_iterations = 10
+
+    for _ in range(max_iterations):
+        try:
+            # ── Tool-call phase (non-streaming, needed for tool use) ────
+            response = client.chat.completions.create(
+                model=MODEL,
+                messages=messages,
+                tools=TOOL_DEFINITIONS,
+                tool_choice="auto",
+                max_tokens=4096
+            )
+
+            message = response.choices[0].message
+            assistant_msg = {"role": "assistant", "content": message.content or ""}
+
+            if message.tool_calls:
+                # Has tool calls — execute them silently, then continue loop
+                assistant_msg["tool_calls"] = [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {"name": tc.function.name, "arguments": tc.function.arguments}
+                    }
+                    for tc in message.tool_calls
+                ]
+                messages.append(assistant_msg)
+
+                for tc in message.tool_calls:
+                    tool_name = tc.function.name
+                    try:
+                        tool_args = json.loads(tc.function.arguments)
+                    except json.JSONDecodeError:
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc.id,
+                            "content": json.dumps({"error": "Invalid arguments."})
+                        })
+                        continue
+
+                    # Notify UI a tool is being used
+                    yield {"type": "tool", "tool": tool_name, "input": tool_args}
+                    tool_calls_made.append({"tool": tool_name, "input": tool_args})
+
+                    result = execute_tool(tool_name, tool_args, github_token, github_username, groq_client=client)
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": result
+                    })
+
+            else:
+                # No tool calls — stream the final text response
+                messages.append(assistant_msg)
+
+                stream = client.chat.completions.create(
+                    model=MODEL,
+                    messages=messages,
+                    max_tokens=4096,
+                    stream=True
+                )
+
+                full_text = ""
+                for chunk in stream:
+                    delta = chunk.choices[0].delta
+                    if delta.content:
+                        full_text += delta.content
+                        yield {"type": "text", "content": delta.content}
+
+                # Update the last assistant message with full streamed text
+                messages[-1]["content"] = full_text
+                yield {"type": "done", "tool_calls": tool_calls_made}
+                return
+
+        except Exception as e:
+            error_msg = str(e)
+            if "tool_use_failed" in error_msg:
+                if messages and messages[-1].get("role") == "assistant":
+                    messages.pop()
+                if messages and messages[-1].get("role") == "user":
+                    messages[-1] = {"role": "user", "content": f"Please do this carefully: {user_message}"}
+                continue
+            yield {"type": "error", "content": f"Error: {error_msg}"}
+            return
+
+    yield {"type": "error", "content": "Could not complete the request. Please try rephrasing."}
