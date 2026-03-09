@@ -4,7 +4,10 @@ import json
 import hashlib
 from datetime import datetime, timedelta
 
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agent.db")
+# Use /tmp on Streamlit Cloud (survives reruns but not redeploys)
+# Use local path for development
+_base_dir = "/tmp" if os.path.exists("/tmp") and not os.path.exists(".env") else os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(_base_dir, "agent.db")
 
 
 def get_user_id(github_token: str) -> str:
@@ -15,6 +18,23 @@ def get_user_id(github_token: str) -> str:
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
+
+    # Migrate old single-user schema to new multi-user schema
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='settings'")
+    if cursor.fetchone():
+        cursor.execute("DROP TABLE IF EXISTS chat_messages")
+        cursor.execute("DROP TABLE IF EXISTS chat_sessions")
+        cursor.execute("DROP TABLE IF EXISTS settings")
+
+    # Also migrate old chat_sessions that don't have user_id column
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='chat_sessions'")
+    if cursor.fetchone():
+        cursor.execute("PRAGMA table_info(chat_sessions)")
+        cols = [r[1] for r in cursor.fetchall()]
+        if "user_id" not in cols:
+            cursor.execute("DROP TABLE IF EXISTS chat_messages")
+            cursor.execute("DROP TABLE IF EXISTS chat_sessions")
+
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS chat_sessions (
             id         INTEGER PRIMARY KEY AUTOINCREMENT,
