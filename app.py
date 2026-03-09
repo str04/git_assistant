@@ -10,8 +10,8 @@ from bug_fixer import run_bug_fixer
 from issue_to_pr import run_issue_to_pr
 from config import GROQ_API_KEY, get_github_headers, GITHUB_API
 from tools.files import create_or_update_file
+from security import encrypt_token, decrypt_token, get_user_id, is_token_format_valid
 from database import (
-    get_user_id,
     create_session, get_all_sessions, delete_session, update_session_title,
     save_message, load_messages, load_messages_for_agent, cleanup_old_sessions
 )
@@ -41,6 +41,12 @@ st.markdown("""
     font-weight: bold;
 }
 .session-time { font-size: 0.75em; color: #888; }
+
+/* Chat messages formatting only — input positioning handled by Streamlit */
+.stChatMessage p { line-height: 1.7; }
+.stChatMessage ul { margin: 8px 0 8px 16px; }
+.stChatMessage li { margin: 4px 0; }
+.stChatMessage a { color: #4ade80 !important; }
 .dashboard-card {
     background: #1e293b;
     border: 1px solid #334155;
@@ -166,7 +172,14 @@ def fetch_dashboard_data(token: str, username: str) -> dict:
 if not st.session_state.connected and not st.session_state.auto_connect_tried:
     st.session_state.auto_connect_tried = True
     try:
-        saved_token = cookie_manager.get("gh_token")
+        raw_cookie = cookie_manager.get("gh_token")
+        if raw_cookie:
+            saved_token = decrypt_token(raw_cookie)
+            if not saved_token:
+                cookie_manager.delete("gh_token")
+                saved_token = None
+        else:
+            saved_token = None
         if saved_token:
             success, _ = do_connect(saved_token)
             if not success:
@@ -194,6 +207,8 @@ if not st.session_state.connected:
             st.error("⚠️ GROQ_API_KEY not configured.")
         elif not github_token:
             st.error("Please enter your GitHub token.")
+        elif not is_token_format_valid(github_token):
+            st.error("❌ Invalid token format. GitHub tokens start with `ghp_`, `gho_`, or `github_pat_`.")
         else:
             with st.spinner("Verifying..."):
                 success, error = do_connect(github_token)
@@ -423,6 +438,12 @@ else:
             else:
                 st.caption("No assigned issues 🎉")
 
+    # ── Chat input lives OUTSIDE tabs so Streamlit pins it to page bottom ──
+    prefill = st.session_state.pop("prefill", None)
+    user_input = st.chat_input("Tell me what to do on GitHub...")
+    if prefill and not user_input:
+        user_input = prefill
+
     # ── Tab 2: Chat ────────────────────────────────────────────────────
     with tab2:
         for entry in st.session_state.chat_history:
@@ -435,11 +456,6 @@ else:
                                 f'<div class="tool-call"><span class="tool-name">{tc["tool"]}</span>({tc["input"]})</div>',
                                 unsafe_allow_html=True
                             )
-
-        prefill = st.session_state.pop("prefill", None)
-        user_input = st.chat_input("Tell me what to do on GitHub...")
-        if prefill and not user_input:
-            user_input = prefill
 
         if user_input:
             with st.chat_message("user"):
