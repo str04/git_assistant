@@ -3,3 +3,4 @@ streamlit
 requests
 python-dotenv
 extra-streamlit-components
+cryptography
