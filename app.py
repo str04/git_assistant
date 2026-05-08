@@ -584,18 +584,16 @@ else:
                     st.session_state.github_username,
                     prompt
                 ):
+                    msg = update.get("status", "")
+                    detail = update.get("detail", "")
                     if update["error"]:
-                        st.error(f"**{update['agent']}** — {update['status']}")
-                        if update["detail"]:
-                            st.caption(update["detail"])
+                        st.error(msg)
                     elif update["done"]:
-                        st.success(f"**{update['agent']}** — {update['status']}")
-                        if update["detail"]:
-                            st.caption(update["detail"])
+                        st.success(msg)
                     else:
-                        st.info(f"**{update['agent']}** — {update['status']}")
-                        if update["detail"]:
-                            st.caption(update["detail"])
+                        st.info(msg)
+                    if detail:
+                        st.caption(detail)
                     if "repo_url" in update:
                         final_url = update["repo_url"]
 
