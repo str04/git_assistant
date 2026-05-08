@@ -533,22 +533,25 @@ else:
             "📄 **Docs Agent** → generates README"
         )
 
+        # Example buttons
+        st.markdown("**💡 Quick examples — click to use:**")
         pipeline_examples = [
             "A FastAPI backend with CRUD endpoints for a todo list app",
             "A Python web scraper that extracts article titles from news websites",
             "A simple Express.js REST API with user authentication",
             "A Python CLI tool that converts CSV files to JSON",
         ]
-        selected_example = st.selectbox(
-            "Pick an example or write your own below:",
-            [""] + pipeline_examples,
-            key="pipeline_example"
-        )
+        ex_cols = st.columns(2)
+        for i, ex in enumerate(pipeline_examples):
+            if ex_cols[i % 2].button(ex, key=f"ex_{i}", use_container_width=True):
+                st.session_state["pipeline_prompt_value"] = ex
+
+        # Free text area — always editable
         project_prompt = st.text_area(
             "Describe your project",
-            value=selected_example,
+            value=st.session_state.get("pipeline_prompt_value", ""),
             placeholder="e.g. A Flask REST API with endpoints for user authentication and a SQLite database",
-            height=100,
+            height=120,
             key="project_prompt"
         )
 
