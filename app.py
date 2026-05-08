@@ -142,10 +142,23 @@ def fetch_dashboard_data(token: str, username: str) -> dict:
     data = {"repos": [], "open_prs": [], "open_issues": []}
 
     try:
-        # Get repos
-        resp = requests.get(f"{GITHUB_API}/user/repos?sort=updated&per_page=6", headers=headers)
-        if resp.status_code == 200:
-            data["repos"] = resp.json()
+        # Get all repos
+        all_repos = []
+        page = 1
+        while True:
+            resp = requests.get(f"{GITHUB_API}/user/repos?sort=updated&per_page=100&page={page}", headers=headers)
+            if resp.status_code == 200:
+                batch = resp.json()
+                if not batch:
+                    break
+                all_repos.extend(batch)
+                if len(batch) < 100:
+                    break
+                page += 1
+            else:
+                break
+        data["repos"] = all_repos
+        data["total_repos"] = len(all_repos)
     except Exception:
         pass
 
@@ -365,12 +378,14 @@ else:
             if "dashboard_data" in st.session_state:
                 del st.session_state["dashboard_data"]
 
-        if "dashboard_data" not in st.session_state:
+        # Always load fresh data on tab open — use a refresh flag
+        if "dashboard_data" not in st.session_state or st.session_state.get("dashboard_needs_refresh", True):
             with st.spinner("Loading your GitHub data..."):
                 st.session_state["dashboard_data"] = fetch_dashboard_data(
                     st.session_state.github_token,
                     st.session_state.github_username
                 )
+                st.session_state["dashboard_needs_refresh"] = False
 
         dash = st.session_state["dashboard_data"]
         repos = dash.get("repos", [])
@@ -378,9 +393,10 @@ else:
         open_issues = dash.get("open_issues", [])
 
         # Stats row
+        total_repos = dash.get("total_repos", len(repos))
         c1, c2, c3 = st.columns(3)
         with c1:
-            st.markdown(f'<div class="dashboard-card"><div class="stat-number">{len(repos)}</div><div class="stat-label">Recent Repos</div></div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="dashboard-card"><div class="stat-number">{total_repos}</div><div class="stat-label">Total Repos</div></div>', unsafe_allow_html=True)
         with c2:
             st.markdown(f'<div class="dashboard-card"><div class="stat-number pr-open">{len(open_prs)}</div><div class="stat-label">Open Pull Requests</div></div>', unsafe_allow_html=True)
         with c3:
@@ -584,6 +600,7 @@ else:
                         final_url = update["repo_url"]
 
                 if final_url:
+                    st.session_state["dashboard_needs_refresh"] = True
                     st.balloons()
                     st.markdown(f"### ✅ Project ready!")
                     st.markdown(f"[🔗 View on GitHub]({final_url})")
