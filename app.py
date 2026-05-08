@@ -533,24 +533,23 @@ else:
             "📄 **Docs Agent** → generates README"
         )
 
-        # Example buttons
-        st.markdown("**💡 Quick examples — click to use:**")
         pipeline_examples = [
+            "",
             "A FastAPI backend with CRUD endpoints for a todo list app",
             "A Python web scraper that extracts article titles from news websites",
             "A simple Express.js REST API with user authentication",
             "A Python CLI tool that converts CSV files to JSON",
         ]
-        ex_cols = st.columns(2)
-        for i, ex in enumerate(pipeline_examples):
-            if ex_cols[i % 2].button(ex, key=f"ex_{i}", use_container_width=True):
-                st.session_state["pipeline_prompt_value"] = ex
+        selected = st.selectbox(
+            "💡 Pick an example to get started (or skip and type below):",
+            pipeline_examples,
+            key="pipeline_example"
+        )
 
-        # Free text area — always editable
         project_prompt = st.text_area(
-            "Describe your project",
-            value=st.session_state.get("pipeline_prompt_value", ""),
-            placeholder="e.g. A Flask REST API with endpoints for user authentication and a SQLite database",
+            "✏️ Describe your project (type anything here):",
+            value=selected,
+            placeholder="e.g. A movie recommendation website using Python and Flask",
             height=120,
             key="project_prompt"
         )
