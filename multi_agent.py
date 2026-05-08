@@ -311,9 +311,23 @@ def run_pipeline(groq_api_key: str, github_token: str, github_username: str, use
 
     try:
         result = create_repo(github_token, name=repo_name, description=plan.get("description", ""), private=False, auto_init=False)
-        if not result.get("success"):
-            raise Exception(result.get("error", "Failed to create repo"))
-        yield {"status": f"✅ Repo created", "detail": f"https://github.com/{github_username}/{repo_name}", "done": False, "error": False}
+        if result.get("success"):
+            yield {"status": f"✅ Repo created", "detail": f"https://github.com/{github_username}/{repo_name}", "done": False, "error": False}
+        else:
+            error_msg = result.get("error", "")
+            # If repo already exists, continue using it instead of failing
+            if "already exists" in error_msg.lower() or "name already exists" in error_msg.lower():
+                yield {"status": f"⚠️ Repo `{repo_name}` already exists — pushing files into it", "detail": "", "done": False, "error": False}
+            else:
+                # Try with a suffix to make name unique
+                import time
+                repo_name = f"{repo_name}-{int(time.time()) % 1000}"
+                yield {"status": f"⚠️ Name taken — trying `{repo_name}`...", "detail": "", "done": False, "error": False}
+                result2 = create_repo(github_token, name=repo_name, description=plan.get("description", ""), private=False, auto_init=False)
+                if not result2.get("success"):
+                    yield {"status": "❌ Could not create repo", "detail": result2.get("error", error_msg), "done": False, "error": True}
+                    return
+                yield {"status": f"✅ Repo created as `{repo_name}`", "detail": f"https://github.com/{github_username}/{repo_name}", "done": False, "error": False}
     except Exception as e:
         yield {"status": "❌ Could not create repo", "detail": str(e), "done": False, "error": True}
         return
